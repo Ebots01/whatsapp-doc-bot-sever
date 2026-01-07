@@ -116,7 +116,7 @@ app.post("/webhook", async (req, res) => {
         console.log(`📥 Downloading ${msgType}...`);
 
         // 3. Get the Download URL from Meta
-        const urlRes = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
+        const urlRes = await axios.get(`https://graph.facebook.com/v21.0/${mediaId}`, {
           headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
         });
         
@@ -152,7 +152,7 @@ app.post("/webhook", async (req, res) => {
 async function sendMessage(phoneId, to, text) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v18.0/${phoneId}/messages`,
+      `https://graph.facebook.com/v21.0/${phoneId}/messages`,
       {
         messaging_product: "whatsapp",
         to: to,
@@ -168,7 +168,7 @@ async function sendMessage(phoneId, to, text) {
 async function markAsRead(phoneId, messageId) {
     try {
         await axios.post(
-            `https://graph.facebook.com/v18.0/${phoneId}/messages`,
+            `https://graph.facebook.com/v21.0/${phoneId}/messages`,
             { messaging_product: "whatsapp", status: "read", message_id: messageId },
             { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } }
         );
