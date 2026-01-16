@@ -36,17 +36,19 @@ app.post("/webhook", async (req, res) => {
     const value = changes?.value;
     const message = value?.messages?.[0];
 
+    // CRITICAL: Get the Phone Number ID that received the message
+    // This ensures your bot works even if you have multiple numbers later
+    const businessPhoneId = value?.metadata?.phone_number_id;
+
     if (message) {
       const from = message.from; // The user's phone number
       const msgType = message.type;
-      
-      // Use the ID from your curl command (stored in env)
-      const phoneId = process.env.PHONE_NUMBER_ID; 
 
       // --- LOGIC: Handle Text ---
       if (msgType === "text") {
         console.log(`📩 Received text from ${from}`);
-        await sendMessage(phoneId, from, "I received your text! Send me a PDF or Photo to save it.");
+        // Passing businessPhoneId ensures the reply comes from the correct number
+        await sendMessage(businessPhoneId, from, "I received your text! Send me a PDF or Photo to save it.");
       } 
       
       // --- LOGIC: Handle Documents & Images ---
@@ -60,7 +62,7 @@ app.post("/webhook", async (req, res) => {
         // 2. Create Unique Filename
         const fileName = `${Date.now()}_${defaultName.replace(/\s+/g, '_')}`;
 
-        // 3. Get Media URL (Using v22.0)
+        // 3. Get Media URL (Using v24.0)
         const urlRes = await axios.get(`https://graph.facebook.com/v24.0/${mediaId}`, {
             headers: { Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}` }
         });
@@ -78,22 +80,26 @@ app.post("/webhook", async (req, res) => {
         });
 
         // 6. Reply to User
-        await sendMessage(phoneId, from, `✅ Saved! View here: ${blob.url}`);
+        await sendMessage(businessPhoneId, from, `✅ Saved! View here: ${blob.url}`);
       }
     }
     res.sendStatus(200);
 
   } catch (error) {
-    console.error("❌ Error:", error.response ? error.response.data : error.message);
+    // Better error logging to see API response details
+    console.error("❌ Error:", error.response ? JSON.stringify(error.response.data, null, 2) : error.message);
     res.sendStatus(500);
   }
 });
 
-// --- HELPER: Send Message (Matches your CURL command) ---
+// --- HELPER: Send Message ---
 async function sendMessage(phoneId, to, textBody) {
+  // FALLBACK: If phoneId wasn't captured from webhook, use the env variable
+  const senderId = phoneId || process.env.PHONE_NUMBER_ID; 
+
   try {
     await axios.post(
-      `https://graph.facebook.com/v24.0/${phoneId}/messages`, // Using v22.0
+      `https://graph.facebook.com/v24.0/${senderId}/messages`, 
       {
         messaging_product: "whatsapp",
         to: to,
@@ -116,7 +122,7 @@ async function sendMessage(phoneId, to, textBody) {
 app.get("/", async (req, res) => {
     try {
         const { blobs } = await list({ token: process.env.BLOB_READ_WRITE_TOKEN });
-        res.json(blobs); // Simple JSON list for now
+        res.json(blobs); 
     } catch (e) { res.send("Error loading files"); }
 });
 
