@@ -19,14 +19,21 @@ const SERVER_URL = process.env.SERVER_URL;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 // -------------------------------------------------------------
-// DATABASE CONNECTION & SCHEMA (Auto-Delete Configured Here)
+// DATABASE CONNECTION (Optimized for Vercel)
 // -------------------------------------------------------------
-if (!MONGODB_URI) {
-  console.error("❌ MONGODB_URI is missing.");
-} else {
-  mongoose.connect(MONGODB_URI)
-    .then(() => console.log("✅ Connected to MongoDB"))
-    .catch(err => console.error("❌ MongoDB Connection Error:", err));
+// We use a cached connection to prevent crashing on "cold starts"
+let cachedDb = null;
+
+async function connectToDatabase() {
+  if (cachedDb) return cachedDb;
+  
+  if (!MONGODB_URI) throw new Error("MONGODB_URI is missing");
+  
+  const opts = { bufferCommands: false };
+  const conn = await mongoose.connect(MONGODB_URI, opts);
+  cachedDb = conn;
+  console.log("✅ New MongoDB Connection Created");
+  return conn;
 }
 
 const fileSchema = new mongoose.Schema({
@@ -35,20 +42,48 @@ const fileSchema = new mongoose.Schema({
   timestamp: String,
   whatsapp_id: String,
   url: String,
+  from_mobile: String, // Store who sent it
   createdAt: { 
     type: Date, 
     default: Date.now, 
-    expires: 600 // <--- THIS IS THE MAGIC: Auto-delete 600 seconds (10 mins) after creation
+    expires: 600 // Auto-delete after 10 mins
   } 
 });
 
-const FileModel = mongoose.model('File', fileSchema);
+// Use 'models.File' to prevent OverwriteModelError in serverless mode
+const FileModel = mongoose.models.File || mongoose.model('File', fileSchema);
+
+// -------------------------------------------------------------
+// HELPER: SEND MESSAGE BACK TO WHATSAPP
+// -------------------------------------------------------------
+async function sendReply(businessPhoneId, toMobile, text) {
+  try {
+    await axios.post(
+      `https://graph.facebook.com/v17.0/${businessPhoneId}/messages`,
+      {
+        messaging_product: "whatsapp",
+        to: toMobile,
+        text: { body: text }
+      },
+      {
+        headers: { 
+          'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json' 
+        }
+      }
+    );
+    console.log(`📤 Reply sent to ${toMobile}`);
+  } catch (error) {
+    console.error("❌ Failed to send reply:", error.response ? error.response.data : error.message);
+  }
+}
 
 // -------------------------------------------------------------
 // 1. WEB UI
 // -------------------------------------------------------------
 app.get('/', async (req, res) => {
   try {
+    await connectToDatabase(); // Ensure DB is connected
     const files = await FileModel.find().sort({ createdAt: -1 });
 
     const fileRows = files.map(f => `
@@ -57,7 +92,7 @@ app.get('/', async (req, res) => {
         <td class="px-6 py-4 font-medium text-gray-900 flex items-center gap-2">
           <span class="text-green-600">📄</span> ${f.pathname}
         </td>
-        <td class="px-6 py-4 text-sm text-gray-500">${f.mime_type}</td>
+        <td class="px-6 py-4 text-sm text-gray-500">${f.from_mobile || 'Unknown'}</td>
         <td class="px-6 py-4">
           <a href="${f.url}" target="_blank" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 text-sm transition">
             Download
@@ -66,116 +101,46 @@ app.get('/', async (req, res) => {
       </tr>
     `).join('');
 
-    const html = `
+    res.send(`
       <!DOCTYPE html>
       <html lang="en">
       <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>WhatsApp Doc Server</title>
+        <title>WhatsApp Server</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <meta http-equiv="refresh" content="30"> </head>
-      <body class="bg-gray-50 font-sans min-h-screen">
-        <div class="max-w-5xl mx-auto py-10 px-4">
-          <div class="bg-white shadow-xl rounded-2xl overflow-hidden border border-gray-100">
-            <div class="bg-[#128C7E] p-8 text-white flex justify-between items-center">
-              <div>
-                <h1 class="text-3xl font-bold">WhatsApp Documents</h1>
-                <p class="text-teal-100 mt-2 opacity-90">Auto-Delete Enabled (10 Mins)</p>
-              </div>
-              <div class="bg-white/20 px-4 py-2 rounded-lg backdrop-blur-sm">
-                <span class="font-mono font-bold text-2xl">${files.length}</span> Files
-              </div>
-            </div>
-            
-            <div class="overflow-x-auto">
-              <table class="w-full text-left border-collapse">
-                <thead>
-                  <tr class="bg-gray-100 text-gray-600 uppercase text-xs tracking-wider">
-                    <th class="px-6 py-4 font-semibold">Time Received</th>
-                    <th class="px-6 py-4 font-semibold">Filename</th>
-                    <th class="px-6 py-4 font-semibold">Type</th>
-                    <th class="px-6 py-4 font-semibold">Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  ${files.length > 0 ? fileRows : 
-                    '<tr><td colspan="4" class="p-10 text-center text-gray-400 italic">No documents found.<br>(Files are auto-deleted after 10 minutes)</td></tr>'}
-                </tbody>
-              </table>
-            </div>
+        <meta http-equiv="refresh" content="30">
+      </head>
+      <body class="bg-gray-50 p-10 font-sans">
+        <div class="max-w-5xl mx-auto bg-white shadow-xl rounded-2xl overflow-hidden">
+          <div class="bg-teal-600 p-8 text-white">
+            <h1 class="text-3xl font-bold">WhatsApp Documents</h1>
+            <p>Files auto-delete after 10 mins</p>
           </div>
-          
-          <div class="mt-4 text-center">
-             <form action="/api/clear-all" method="POST">
-               <button type="submit" class="text-red-500 text-sm hover:underline">
-                 ⚠️ Emergency: Clear All Data Now
-               </button>
-             </form>
-          </div>
+          <table class="w-full text-left">
+            <thead>
+              <tr class="bg-gray-100">
+                <th class="px-6 py-4">Time</th>
+                <th class="px-6 py-4">Filename</th>
+                <th class="px-6 py-4">Sender</th>
+                <th class="px-6 py-4">Action</th>
+              </tr>
+            </thead>
+            <tbody>${fileRows || '<tr><td colspan="4" class="p-10 text-center">No files yet</td></tr>'}</tbody>
+          </table>
+          <form action="/api/clear-all" method="POST" class="p-4 text-center">
+             <button type="submit" class="text-red-500 hover:underline">Clear All Data</button>
+          </form>
         </div>
       </body>
       </html>
-    `;
-    res.send(html);
+    `);
   } catch (error) {
     console.error(error);
-    res.status(500).send("Error loading UI");
+    res.status(500).send("Server Error");
   }
 });
 
 // -------------------------------------------------------------
-// 2. FLUTTER API
-// -------------------------------------------------------------
-app.get('/api/files', async (req, res) => {
-  try {
-    const files = await FileModel.find().sort({ createdAt: -1 });
-    res.json(files);
-  } catch (error) {
-    res.status(500).json({ error: "Database error" });
-  }
-});
-
-// -------------------------------------------------------------
-// 3. MANUAL CLEAR ENDPOINT (Forcing deletion manually)
-// -------------------------------------------------------------
-app.post('/api/clear-all', async (req, res) => {
-  try {
-    await FileModel.deleteMany({});
-    console.log("⚠️ Database manually cleared.");
-    res.redirect('/');
-  } catch (error) {
-    res.status(500).send("Failed to clear database");
-  }
-});
-
-// -------------------------------------------------------------
-// 4. PROXY DOWNLOAD
-// -------------------------------------------------------------
-app.get('/api/proxy/:mediaId', async (req, res) => {
-  const mediaId = req.params.mediaId;
-  try {
-    const urlResponse = await axios.get(`https://graph.facebook.com/v17.0/${mediaId}`, {
-      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-    });
-    const actualUrl = urlResponse.data.url;
-    const fileResponse = await axios({
-      method: 'get',
-      url: actualUrl,
-      responseType: 'stream',
-      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-    });
-    res.setHeader('Content-Type', urlResponse.data.mime_type);
-    res.setHeader('Content-Disposition', `attachment; filename="whatsapp_doc.pdf"`);
-    fileResponse.data.pipe(res);
-  } catch (error) {
-    console.error("Proxy Error:", error.message);
-    res.status(500).send("Error fetching file.");
-  }
-});
-
-// -------------------------------------------------------------
-// 5. WEBHOOK
+// 2. WEBHOOK (Receive & Reply)
 // -------------------------------------------------------------
 app.get('/webhook', (req, res) => {
   if (req.query['hub.mode'] === 'subscribe' && 
@@ -188,29 +153,81 @@ app.get('/webhook', (req, res) => {
 
 app.post('/webhook', async (req, res) => {
   const body = req.body;
-  if (body.object) {
-    if (body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
-      const msg = body.entry[0].changes[0].value.messages[0];
+
+  // Immediately respond 200 OK to WhatsApp so they don't retry/ban us
+  res.sendStatus(200);
+
+  try {
+    if (body.object && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
+      const change = body.entry[0].changes[0].value;
+      const msg = change.messages[0];
+      const businessPhoneId = change.metadata.phone_number_id; // Your Bot ID
+      const userMobile = msg.from; // The User's Mobile
+
+      // Handle Documents
       if (msg.type === 'document') {
+        await connectToDatabase(); // Connect to DB
+
         const doc = msg.document;
         const newFile = {
           pathname: doc.filename || `doc_${msg.timestamp}.pdf`,
           mime_type: doc.mime_type,
           timestamp: new Date().toLocaleTimeString(),
           whatsapp_id: doc.id,
+          from_mobile: userMobile,
           url: `${SERVER_URL}/api/proxy/${doc.id}`
         };
-        try {
-          await FileModel.create(newFile);
-          console.log(`✅ Saved: ${newFile.pathname}`);
-        } catch (err) {
-          console.error("❌ DB Error:", err);
-        }
+
+        // 1. Save to DB
+        await FileModel.create(newFile);
+        console.log(`✅ Saved file from ${userMobile}`);
+
+        // 2. Send "Pin" / Confirmation back to user
+        await sendReply(businessPhoneId, userMobile, `✅ Received: ${newFile.pathname}\nCheck the server dashboard to download.`);
+      }
+      
+      // Handle Text Messages (Optional Debugging)
+      else if (msg.type === 'text') {
+        console.log(`💬 Text from ${userMobile}: ${msg.text.body}`);
+        // Uncomment below to echo text back
+        // await sendReply(businessPhoneId, userMobile, "I only accept documents (PDF/Doc)!"); 
       }
     }
-    res.sendStatus(200);
-  } else {
-    res.sendStatus(404);
+  } catch (err) {
+    console.error("❌ Webhook processing error:", err.message);
+  }
+});
+
+// -------------------------------------------------------------
+// 3. PROXY & API
+// -------------------------------------------------------------
+app.get('/api/files', async (req, res) => {
+  await connectToDatabase();
+  const files = await FileModel.find().sort({ createdAt: -1 });
+  res.json(files);
+});
+
+app.post('/api/clear-all', async (req, res) => {
+  await connectToDatabase();
+  await FileModel.deleteMany({});
+  res.redirect('/');
+});
+
+app.get('/api/proxy/:mediaId', async (req, res) => {
+  try {
+    const urlResponse = await axios.get(`https://graph.facebook.com/v17.0/${req.params.mediaId}`, {
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+    });
+    const fileResponse = await axios({
+      method: 'get',
+      url: urlResponse.data.url,
+      responseType: 'stream',
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+    });
+    res.setHeader('Content-Type', urlResponse.data.mime_type);
+    fileResponse.data.pipe(res);
+  } catch (error) {
+    res.status(500).send("Error fetching file.");
   }
 });
 
