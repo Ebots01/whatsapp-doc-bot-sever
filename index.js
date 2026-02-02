@@ -1,9 +1,9 @@
-// index.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const axios = require('axios');
 const cors = require('cors');
 const mongoose = require('mongoose');
+const path = require('path');
 
 const app = express();
 app.use(bodyParser.json());
@@ -15,18 +15,16 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
-const SERVER_URL = process.env.SERVER_URL;
+const SERVER_URL = process.env.SERVER_URL; // Your Vercel URL
 const MONGODB_URI = process.env.MONGODB_URI;
 
 // -------------------------------------------------------------
 // DATABASE CONNECTION (Optimized for Vercel)
 // -------------------------------------------------------------
-// We use a cached connection to prevent crashing on "cold starts"
 let cachedDb = null;
 
 async function connectToDatabase() {
   if (cachedDb) return cachedDb;
-  
   if (!MONGODB_URI) throw new Error("MONGODB_URI is missing");
   
   const opts = { bufferCommands: false };
@@ -36,13 +34,14 @@ async function connectToDatabase() {
   return conn;
 }
 
+// Data Structure (Matches index1.js features)
 const fileSchema = new mongoose.Schema({
-  pathname: String,
-  mime_type: String,
-  timestamp: String,
-  whatsapp_id: String,
-  url: String,
-  from_mobile: String, // Store who sent it
+  pin: String,            // The 4-digit PIN
+  whatsapp_id: String,    // ID to fetch file from WhatsApp
+  filename: String,       // Original filename
+  mime_type: String,      // PDF or Image
+  sender_mobile: String,
+  extension: String,      // .pdf or .jpg
   createdAt: { 
     type: Date, 
     default: Date.now, 
@@ -50,185 +49,269 @@ const fileSchema = new mongoose.Schema({
   } 
 });
 
-// Use 'models.File' to prevent OverwriteModelError in serverless mode
 const FileModel = mongoose.models.File || mongoose.model('File', fileSchema);
 
 // -------------------------------------------------------------
-// HELPER: SEND MESSAGE BACK TO WHATSAPP
+// HELPER FUNCTIONS
 // -------------------------------------------------------------
-async function sendReply(businessPhoneId, toMobile, text) {
+function generatePin() {
+  return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+async function sendMessage(phoneId, to, textBody) {
   try {
     await axios.post(
-      `https://graph.facebook.com/v17.0/${businessPhoneId}/messages`,
+      `https://graph.facebook.com/v17.0/${phoneId}/messages`, 
       {
         messaging_product: "whatsapp",
-        to: toMobile,
-        text: { body: text }
+        to: to,
+        type: "text",
+        text: { body: textBody }
       },
-      {
+      { 
         headers: { 
-          'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json' 
-        }
+          Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+          "Content-Type": "application/json"
+        } 
       }
     );
-    console.log(`📤 Reply sent to ${toMobile}`);
-  } catch (error) {
-    console.error("❌ Failed to send reply:", error.response ? error.response.data : error.message);
+    console.log(`📤 Message sent to ${to}`);
+  } catch (err) {
+    console.error("❌ Failed to send WhatsApp message:", err.message);
   }
 }
 
 // -------------------------------------------------------------
-// 1. WEB UI
+// WEBHOOK (The "Same Logic" Fix)
 // -------------------------------------------------------------
-app.get('/', async (req, res) => {
-  try {
-    await connectToDatabase(); // Ensure DB is connected
-    const files = await FileModel.find().sort({ createdAt: -1 });
-
-    const fileRows = files.map(f => `
-      <tr class="hover:bg-gray-50 border-b">
-        <td class="px-6 py-4 text-sm text-gray-700">${f.timestamp}</td>
-        <td class="px-6 py-4 font-medium text-gray-900 flex items-center gap-2">
-          <span class="text-green-600">📄</span> ${f.pathname}
-        </td>
-        <td class="px-6 py-4 text-sm text-gray-500">${f.from_mobile || 'Unknown'}</td>
-        <td class="px-6 py-4">
-          <a href="${f.url}" target="_blank" class="px-3 py-1 bg-green-600 text-white rounded hover:bg-green-700 text-sm transition">
-            Download
-          </a>
-        </td>
-      </tr>
-    `).join('');
-
-    res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <title>WhatsApp Server</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-        <meta http-equiv="refresh" content="30">
-      </head>
-      <body class="bg-gray-50 p-10 font-sans">
-        <div class="max-w-5xl mx-auto bg-white shadow-xl rounded-2xl overflow-hidden">
-          <div class="bg-teal-600 p-8 text-white">
-            <h1 class="text-3xl font-bold">WhatsApp Documents</h1>
-            <p>Files auto-delete after 10 mins</p>
-          </div>
-          <table class="w-full text-left">
-            <thead>
-              <tr class="bg-gray-100">
-                <th class="px-6 py-4">Time</th>
-                <th class="px-6 py-4">Filename</th>
-                <th class="px-6 py-4">Sender</th>
-                <th class="px-6 py-4">Action</th>
-              </tr>
-            </thead>
-            <tbody>${fileRows || '<tr><td colspan="4" class="p-10 text-center">No files yet</td></tr>'}</tbody>
-          </table>
-          <form action="/api/clear-all" method="POST" class="p-4 text-center">
-             <button type="submit" class="text-red-500 hover:underline">Clear All Data</button>
-          </form>
-        </div>
-      </body>
-      </html>
-    `);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send("Server Error");
-  }
-});
-
-// -------------------------------------------------------------
-// 2. WEBHOOK (Receive & Reply)
-// -------------------------------------------------------------
-app.get('/webhook', (req, res) => {
-  if (req.query['hub.mode'] === 'subscribe' && 
-      req.query['hub.verify_token'] === VERIFY_TOKEN) {
-    res.send(req.query['hub.challenge']);
+app.get("/webhook", (req, res) => {
+  if (req.query["hub.mode"] === "subscribe" && req.query["hub.verify_token"] === VERIFY_TOKEN) {
+    res.status(200).send(req.query["hub.challenge"]);
   } else {
-    res.sendStatus(400);
+    res.sendStatus(403);
   }
 });
 
-app.post('/webhook', async (req, res) => {
+app.post("/webhook", async (req, res) => {
   const body = req.body;
-
-  // Immediately respond 200 OK to WhatsApp so they don't retry/ban us
+  
+  // 1. Acknowledge immediately to keep WhatsApp happy
   res.sendStatus(200);
 
+  if (!body.object) return;
+
   try {
-    if (body.object && body.entry && body.entry[0].changes && body.entry[0].changes[0].value.messages) {
-      const change = body.entry[0].changes[0].value;
-      const msg = change.messages[0];
-      const businessPhoneId = change.metadata.phone_number_id; // Your Bot ID
-      const userMobile = msg.from; // The User's Mobile
+    const changes = body.entry?.[0]?.changes?.[0]?.value;
+    if (!changes || !changes.messages) return;
 
-      // Handle Documents
-      if (msg.type === 'document') {
-        await connectToDatabase(); // Connect to DB
+    const message = changes.messages[0];
+    const businessPhoneId = changes.metadata.phone_number_id;
+    const from = message.from;
+    const msgType = message.type;
 
-        const doc = msg.document;
-        const newFile = {
-          pathname: doc.filename || `doc_${msg.timestamp}.pdf`,
-          mime_type: doc.mime_type,
-          timestamp: new Date().toLocaleTimeString(),
-          whatsapp_id: doc.id,
-          from_mobile: userMobile,
-          url: `${SERVER_URL}/api/proxy/${doc.id}`
-        };
+    // Connect to DB only when needed
+    await connectToDatabase();
 
-        // 1. Save to DB
-        await FileModel.create(newFile);
-        console.log(`✅ Saved file from ${userMobile}`);
-
-        // 2. Send "Pin" / Confirmation back to user
-        await sendReply(businessPhoneId, userMobile, `✅ Received: ${newFile.pathname}\nCheck the server dashboard to download.`);
-      }
-      
-      // Handle Text Messages (Optional Debugging)
-      else if (msg.type === 'text') {
-        console.log(`💬 Text from ${userMobile}: ${msg.text.body}`);
-        // Uncomment below to echo text back
-        // await sendReply(businessPhoneId, userMobile, "I only accept documents (PDF/Doc)!"); 
-      }
+    // Logic from index1.js: Handle Text
+    if (msgType === "text") {
+      await sendMessage(businessPhoneId, from, "👋 Send a Document or Photo to get a 4-digit PIN.");
+      return;
     }
-  } catch (err) {
-    console.error("❌ Webhook processing error:", err.message);
+
+    // Logic from index1.js: Handle Media (Docs & Images)
+    if (msgType === "document" || msgType === "image") {
+      console.log(`📂 Received ${msgType} from ${from}`);
+
+      // Extract details
+      const mediaId = msgType === "document" ? message.document.id : message.image.id;
+      const originalName = msgType === "document" ? message.document.filename : "photo";
+      const mimeType = msgType === "document" ? message.document.mime_type : message.image.mime_type;
+      
+      // Determine extension
+      let ext = ".bin";
+      if (msgType === "image") ext = ".jpg";
+      else if (mimeType === "application/pdf") ext = ".pdf";
+      else if (originalName.includes(".")) ext = path.extname(originalName);
+
+      const pin = generatePin();
+
+      // Save to MongoDB
+      await FileModel.create({
+        pin: pin,
+        whatsapp_id: mediaId,
+        filename: originalName,
+        mime_type: mimeType,
+        sender_mobile: from,
+        extension: ext
+      });
+
+      console.log(`✅ Saved with PIN: ${pin}`);
+
+      // Send PIN back to user
+      await sendMessage(businessPhoneId, from, `✅ *File Saved!*\n\nPIN: *${pin}*\nExpires in 10 mins.`);
+    }
+
+  } catch (error) {
+    console.error("❌ Webhook Error:", error.message);
   }
 });
 
 // -------------------------------------------------------------
-// 3. PROXY & API
+// DOWNLOAD ROUTE (The Proxy Magic)
 // -------------------------------------------------------------
-app.get('/api/files', async (req, res) => {
-  await connectToDatabase();
-  const files = await FileModel.find().sort({ createdAt: -1 });
-  res.json(files);
+// This mimics the "blob" behavior. When you click download, 
+// we fetch it from WhatsApp and stream it to the browser.
+app.get("/download/:pin", async (req, res) => {
+  try {
+    await connectToDatabase();
+    const { pin } = req.params;
+    
+    // Find file by PIN
+    const file = await FileModel.findOne({ pin: pin });
+
+    if (!file) return res.status(404).send("File not found or expired.");
+
+    // 1. Get the download URL from Facebook
+    const urlResponse = await axios.get(`https://graph.facebook.com/v17.0/${file.whatsapp_id}`, {
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+    });
+
+    const actualUrl = urlResponse.data.url;
+
+    // 2. Stream the file to the user
+    const fileResponse = await axios({
+      method: 'get',
+      url: actualUrl,
+      responseType: 'stream',
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+    });
+
+    // 3. Set headers so it downloads with the PIN name
+    const downloadName = `${file.pin}${file.extension}`;
+    res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    
+    fileResponse.data.pipe(res);
+
+  } catch (error) {
+    console.error("Download Error:", error.message);
+    res.status(500).send("Error fetching file from WhatsApp servers.");
+  }
 });
 
+// -------------------------------------------------------------
+// UI DASHBOARD (Matching index1.js Style)
+// -------------------------------------------------------------
+app.get("/", async (req, res) => {
+  try {
+    await connectToDatabase();
+    // Sort by newest first
+    const files = await FileModel.find().sort({ createdAt: -1 });
+
+    const fileRows = files.map(file => `
+        <tr>
+            <td>
+                <div class="file-info">
+                    <span class="pin-badge">${file.pin}</span>
+                    <span class="file-name">${file.filename || 'No Name'}</span>
+                </div>
+            </td>
+            <td>${new Date(file.createdAt).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</td>
+            <td><span class="status-tag">Active</span></td>
+            <td>
+                <div class="action-buttons">
+                    <a href="/download/${file.pin}" class="btn btn-download" title="Save to computer">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                        Download
+                    </a>
+                </div>
+            </td>
+        </tr>
+    `).join('');
+
+    const html = `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Media Gateway (MongoDB)</title>
+        <style>
+            :root { --whatsapp-green: #25D366; --whatsapp-dark: #075E54; --bg: #f0f2f5; }
+            body { font-family: 'Segoe UI', sans-serif; background: var(--bg); margin: 0; color: #333; }
+            
+            .header { background: var(--whatsapp-dark); color: white; padding: 1.5rem; text-align: center; }
+            .container { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+            
+            .stats-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+            .stat-card { background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); text-align: center; border-bottom: 4px solid var(--whatsapp-green); }
+            
+            .table-container { background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); overflow: hidden; }
+            .table-header { padding: 1.5rem; border-bottom: 1px solid #eee; }
+            
+            table { width: 100%; border-collapse: collapse; }
+            th { background: #f8f9fa; padding: 1rem; text-align: left; color: #666; font-weight: 600; border-bottom: 1px solid #eee; }
+            td { padding: 1rem; border-bottom: 1px solid #eee; vertical-align: middle; }
+            
+            .pin-badge { background: #e7fce3; color: #128C7E; padding: 6px 12px; border-radius: 6px; font-weight: bold; font-family: monospace; font-size: 1.2rem; margin-right: 10px; border: 1px solid #c8e6c9;}
+            .status-tag { background: #fff3cd; color: #856404; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 700; text-transform: uppercase; }
+            
+            .action-buttons { display: flex; gap: 8px; }
+            .btn { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; text-decoration: none; border-radius: 6px; font-weight: 600; font-size: 0.85rem; transition: 0.2s; border: 1px solid transparent; }
+            
+            .btn-download { color: white; background-color: var(--whatsapp-green); }
+            .btn-download:hover { background-color: #20bd5a; transform: translateY(-1px); box-shadow: 0 2px 4px rgba(0,0,0,0.08); }
+
+            .empty-state { padding: 4rem; text-align: center; color: #888; }
+        </style>
+    </head>
+    <body>
+        <div class="header"><h1>Media Gateway</h1></div>
+        <div class="container">
+            <div class="stats-bar">
+                <div class="stat-card"><h3>Active Files</h3><p>${files.length}</p></div>
+                <div class="stat-card"><h3>Expiry</h3><p>10 Mins</p></div>
+                <div class="stat-card"><h3>Storage</h3><p style="color:#25D366">MongoDB</p></div>
+            </div>
+
+            <div class="table-container">
+                <div class="table-header"><h2>Received Documents</h2></div>
+                ${files.length > 0 ? `
+                <table>
+                    <thead>
+                        <tr>
+                            <th>PIN / File</th>
+                            <th>Time</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>${fileRows}</tbody>
+                </table>
+                ` : `<div class="empty-state"><p>No active files.</p></div>`}
+            </div>
+            
+            <div style="text-align:center; margin-top: 20px;">
+                <form action="/api/clear-all" method="POST">
+                   <button type="submit" style="background:none; border:none; color: #d9534f; cursor:pointer;">⚠️ Clear Database</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>
+    `;
+    res.send(html);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send("Dashboard Error");
+  }
+});
+
+// Clear Data Route
 app.post('/api/clear-all', async (req, res) => {
   await connectToDatabase();
   await FileModel.deleteMany({});
   res.redirect('/');
-});
-
-app.get('/api/proxy/:mediaId', async (req, res) => {
-  try {
-    const urlResponse = await axios.get(`https://graph.facebook.com/v17.0/${req.params.mediaId}`, {
-      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-    });
-    const fileResponse = await axios({
-      method: 'get',
-      url: urlResponse.data.url,
-      responseType: 'stream',
-      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
-    });
-    res.setHeader('Content-Type', urlResponse.data.mime_type);
-    fileResponse.data.pipe(res);
-  } catch (error) {
-    res.status(500).send("Error fetching file.");
-  }
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
