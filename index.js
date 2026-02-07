@@ -288,4 +288,67 @@ app.post('/api/clear-all', async (req, res) => {
   res.redirect('/');
 });
 
+// -------------------------------------------------------------
+// NEW: File history schema + API for Flutter app
+// (Added without modifying previous logic or existing models)
+// -------------------------------------------------------------
+/*
+  Note:
+  - The production webhook that saves incoming WhatsApp media can save to this collection
+    (so the Flutter app can fetch the Vercel/Blob URL and original filename).
+  - We create a separate model to avoid clashing with the existing FileModel used for PIN-based downloads.
+*/
+
+// 1. Define your MongoDB Schema for file history
+const fileHistorySchema = new mongoose.Schema({
+  url: String,       // The Vercel Blob URL or any public URL to the file
+  pathname: String,  // The original filename (e.g., "document.pdf")
+  messageId: String, // WhatsApp Message ID
+  createdAt: { type: Date, default: Date.now }
+});
+
+// 2. Create the Model (safe creation to avoid overwrite errors)
+const FileHistoryModel = mongoose.models.FileHistory || mongoose.model('FileHistory', fileHistorySchema);
+
+// 3. Add this GET endpoint for your Flutter App
+app.get('/api/files', async (req, res) => {
+  try {
+    // Ensure DB connection
+    await connectToDatabase();
+
+    // Fetch all files, sorted by newest first
+    const files = await FileHistoryModel.find().sort({ createdAt: -1 });
+    
+    // Map the result to a clean JSON format for Flutter
+    const response = files.map(file => ({
+      url: file.url,
+      pathname: file.pathname, // Ensure your DB saves this field!
+      date: file.createdAt
+    }));
+
+    res.json(response);
+  } catch (error) {
+    console.error('Error fetching files:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+/*
+  Reminder: inside your existing webhook where you process media, save a record to FileHistoryModel.
+  Example (do not uncomment here unless you add the actual blob URL logic):
+
+   // After uploading the binary to Vercel Blob (or obtaining a public URL):
+   const newFile = new FileHistoryModel({
+     url: blob.url,           // e.g., the Vercel Blob public URL
+     pathname: originalName,  // original filename from WhatsApp
+     messageId: message.id    // whatsapp message id (or media id)
+   });
+   await newFile.save();
+
+  This will not change the existing PIN-based FileModel logic that powers /download/:pin.
+*/
+
+// -------------------------------------------------------------
+// START SERVER
+// -------------------------------------------------------------
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
