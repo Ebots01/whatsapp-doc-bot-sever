@@ -253,7 +253,7 @@ app.post("/webhook", async (req, res) => {
       // ---------------------------------------------------------
       // CUSTOM REPLY MESSAGE
       // ---------------------------------------------------------
-      const replyText = `Your PIN: *${pinFilename}*\nThankYou!\nOneTapKiosk`;
+      const replyText = `Your PIN: *${pin}*\nThankYou!\nOneTapKiosk`;
       
       await sendMessage(businessPhoneId, from, replyText);
     }
